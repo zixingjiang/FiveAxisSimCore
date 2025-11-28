@@ -1,7 +1,13 @@
-### Dev environment
-Ubuntu 24.04
+## Getting Started
+This project uses the [uv](https://docs.astral.sh/uv/) Python package and project manager.  Please install uv first if you haven't already.
 
-### Dependencies
-Run `uv sync`
-#### For GPU acceleration
-Cupy: use `nvidia-sim` to check the correct cupy version for your GPU, and modify `cupy-cuda12x` in `pyproject.toml`.
+1. Clone the repository
+2. Install dependencies: `uv sync`
+3. Run the example: `uv run simulate.py`
+
+| Cutting process animation | Before vs after |
+| --- | --- |
+| ![simulation.gif](simulation.gif) | ![comparison.gif](comparison.gif) |
+
+## Todo
+- [ ] Correct mesh rendering in animation output
