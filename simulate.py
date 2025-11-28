@@ -1,4 +1,5 @@
 import numpy as np
+import pyvista as pv
 import open3d as o3d
 from cutter import BaseCutter, TapperCutter, CylinderCutter, BallCutter
 from utils.logger import Logger
@@ -124,8 +125,6 @@ class Simulator:
         trajectory: (N, 3)
         chip_voxel_list: (N,) int
         """
-        import pyvista as pv
-
         trajectory = np.asarray(trajectory)
         chip_voxel_list = np.asarray(chip_voxel_list)
         chip_volume_list = chip_voxel_list * (pitch**3)
@@ -144,6 +143,286 @@ class Simulator:
         )
         pl.show()
 
+    def run_with_animation(
+        self,
+        trajectory: np.ndarray,
+        output_path: str = "simulation.gif",
+        frame_interval: int = 1,
+        fps: int = 10,
+        show_cutter: bool = True,
+        show_trajectory: bool = True,
+        workpiece_color: str = "lightblue",
+        cutter_color: str = "red",
+        window_size: tuple = (1024, 768),
+    ):
+        """
+        Execute cutting simulation with animation output.
+
+        Parameters
+        ----------
+        trajectory : ndarray [N,6]
+            [X,Y,Z,I,J,K] - position and direction for each step
+        output_path : str
+            Path to save the animation (supports .gif, .mp4)
+        frame_interval : int
+            Record a frame every N steps
+        fps : int
+            Frames per second for the output animation
+        show_cutter : bool
+            Whether to show the cutter in the animation
+        show_trajectory : bool
+            Whether to show the trajectory path
+        workpiece_color : str
+            Color of the workpiece mesh
+        cutter_color : str
+            Color of the cutter
+        window_size : tuple
+            Size of the rendering window (width, height)
+
+        Returns
+        -------
+        wp_cut : Sdfer
+            The cut workpiece SDF
+        chip_voxel_list : list[int]
+            Number of voxels removed at each step
+        """
+        # ---- Step 0: Global prefilter ----
+        self._prefilter_workpiece(trajectory)
+        wp_cut = self.sdfer_workpiece
+        cutter = self.cutter
+
+        # Get cutter geometry parameters
+        Rmax = max(
+            getattr(cutter, "radius", 0.0),
+            getattr(cutter, "radius_base", 0.0),
+            getattr(cutter, "radius_tip", 0.0),
+        )
+
+        # Setup plotter for off-screen rendering
+        pl = pv.Plotter(off_screen=True, window_size=window_size)
+        pl.set_background("white")
+
+        # Add trajectory line if requested
+        if show_trajectory:
+            traj_points = trajectory[:, :3]
+            traj_line = pv.Spline(traj_points, len(traj_points) * 2)
+            pl.add_mesh(
+                traj_line, color="gray", line_width=2, opacity=0.5, name="trajectory"
+            )
+
+        # Initial workpiece mesh
+        workpiece_mesh = self._sdfer_to_mesh(wp_cut)
+        if workpiece_mesh is not None:
+            pl.add_mesh(
+                workpiece_mesh, color=workpiece_color, opacity=0.9, name="workpiece"
+            )
+
+        # Set up camera
+        pl.camera_position = "iso"
+        pl.camera.zoom(0.8)
+
+        # Open GIF writer
+        pl.open_gif(output_path, fps=fps)
+
+        # ---- Main cutting loop with animation ----
+        chip_voxel_list = []
+
+        with tqdm(
+            total=len(trajectory), ncols=100, desc="Simulating with animation"
+        ) as pbar:
+            for i, row in enumerate(trajectory):
+                x, y, z, i_, j_, k_ = row
+                origin = np.array([x, y, z])
+                direction = np.array([i_, j_, k_])
+                direction_norm = direction / np.linalg.norm(direction)
+
+                # Perform cutting
+                num_chip_voxels = cutter.cut_inplace(
+                    wp_cut, origin, direction, margin=self.pitch * 4
+                )
+                chip_voxel_list.append(num_chip_voxels)
+
+                # Record frame at specified intervals
+                if i % frame_interval == 0 or i == len(trajectory) - 1:
+                    # Update workpiece mesh
+                    pl.remove_actor("workpiece")
+                    workpiece_mesh = self._sdfer_to_mesh(wp_cut)
+                    if workpiece_mesh is not None:
+                        pl.add_mesh(
+                            workpiece_mesh,
+                            color=workpiece_color,
+                            opacity=0.9,
+                            name="workpiece",
+                        )
+
+                    # Update cutter visualization
+                    if show_cutter:
+                        pl.remove_actor("cutter")
+                        cutter_mesh = self._create_cutter_mesh(
+                            origin, direction_norm, Rmax, cutter.length
+                        )
+                        pl.add_mesh(
+                            cutter_mesh, color=cutter_color, opacity=0.7, name="cutter"
+                        )
+
+                        # Add cutter position marker
+                        pl.remove_actor("cutter_tip")
+                        tip_sphere = pv.Sphere(radius=Rmax * 0.3, center=origin)
+                        pl.add_mesh(tip_sphere, color="yellow", name="cutter_tip")
+
+                    # Add progress indicator
+                    pl.remove_actor("progress_text")
+                    progress_text = f"Step: {i+1}/{len(trajectory)}"
+                    pl.add_text(
+                        progress_text,
+                        position="upper_left",
+                        font_size=12,
+                        name="progress_text",
+                    )
+
+                    # Write frame
+                    pl.write_frame()
+
+                pbar.update(1)
+
+        # Close and save
+        pl.close()
+        self.logger.info(f"Animation saved to {output_path}")
+
+        return wp_cut, chip_voxel_list
+
+    def _sdfer_to_mesh(self, sdfer: Sdfer, level: float = 0.0) -> pv.PolyData | None:
+        """Convert SDF to PyVista mesh using marching cubes."""
+        if sdfer.shape is None:
+            return None
+
+        try:
+            # Create structured grid from SDF
+            grid = pv.ImageData()
+            grid.dimensions = np.array(sdfer.shape)
+            grid.origin = sdfer.pts.min(axis=0)
+            grid.spacing = (sdfer.pts.max(axis=0) - sdfer.pts.min(axis=0)) / (
+                np.array(sdfer.shape) - 2
+            )
+            grid.point_data["sdf"] = sdfer.sdf.reshape(sdfer.shape, order="F").ravel(
+                order="F"
+            )
+
+            # Extract isosurface
+            contour = grid.contour([level], scalars="sdf")
+            if contour.n_points > 0:
+                return contour
+        except Exception as e:
+            self.logger.warn(f"Failed to create mesh: {e}")
+
+        return None
+
+    def _create_cutter_mesh(
+        self, origin: np.ndarray, direction: np.ndarray, radius: float, length: float
+    ) -> pv.PolyData:
+        """Create a mesh representation of the cutter."""
+        # Create a cylinder aligned with Z-axis
+        cylinder = pv.Cylinder(
+            center=(0, 0, length / 2),
+            direction=(0, 0, 1),
+            radius=radius,
+            height=length,
+            resolution=32,
+            capping=True,
+        )
+
+        # Compute rotation to align with direction
+        z_axis = np.array([0, 0, 1])
+        direction = direction / np.linalg.norm(direction)
+
+        if np.allclose(direction, z_axis):
+            rotation_matrix = np.eye(3)
+        elif np.allclose(direction, -z_axis):
+            rotation_matrix = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+        else:
+            # Rodrigues' rotation formula
+            v = np.cross(z_axis, direction)
+            s = np.linalg.norm(v)
+            c = np.dot(z_axis, direction)
+            vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+            rotation_matrix = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s + 1e-10))
+
+        # Apply rotation and translation
+        transform = np.eye(4)
+        transform[:3, :3] = rotation_matrix
+        transform[:3, 3] = origin
+
+        cylinder = cylinder.transform(transform, inplace=False)
+        return cylinder
+
+    def create_comparison_animation(
+        self,
+        original_sdfer: Sdfer,
+        cut_sdfer: Sdfer,
+        trajectory: np.ndarray,
+        output_path: str = "comparison.gif",
+        fps: int = 5,
+        n_frames: int = 36,
+        window_size: tuple = (1200, 600),
+    ):
+        """
+        Create a side-by-side comparison animation showing original vs cut workpiece.
+
+        Parameters
+        ----------
+        original_sdfer : Sdfer
+            Original workpiece SDF
+        cut_sdfer : Sdfer
+            Cut workpiece SDF
+        trajectory : np.ndarray
+            Trajectory array for showing cut path
+        output_path : str
+            Path to save the animation
+        fps : int
+            Frames per second
+        n_frames : int
+            Number of frames for full rotation
+        window_size : tuple
+            Window size (width, height)
+        """
+        pl = pv.Plotter(shape=(1, 2), off_screen=True, window_size=window_size)
+
+        # Left: Original workpiece
+        pl.subplot(0, 0)
+        pl.add_text("Original", position="upper_edge", font_size=14)
+        original_mesh = self._sdfer_to_mesh(original_sdfer)
+        if original_mesh is not None:
+            pl.add_mesh(original_mesh, color="lightgray", opacity=0.9)
+        pl.set_background("white")
+
+        # Right: Cut workpiece with trajectory
+        pl.subplot(0, 1)
+        pl.add_text("After Cutting", position="upper_edge", font_size=14)
+        cut_mesh = self._sdfer_to_mesh(cut_sdfer)
+        if cut_mesh is not None:
+            pl.add_mesh(cut_mesh, color="lightblue", opacity=0.9)
+
+        # Add trajectory
+        traj_points = trajectory[:, :3]
+        traj_line = pv.Spline(traj_points, len(traj_points) * 2)
+        pl.add_mesh(traj_line, color="red", line_width=3, opacity=0.7)
+        pl.set_background("white")
+
+        # Link cameras
+        pl.link_views()
+        pl.camera_position = "iso"
+        pl.camera.zoom(0.8)
+
+        # Create rotation animation
+        pl.open_gif(output_path, fps=fps)
+
+        for i in range(n_frames):
+            pl.camera.azimuth = i * (360 / n_frames)
+            pl.write_frame()
+
+        pl.close()
+        self.logger.info(f"Comparison animation saved to {output_path}")
+
 
 # ------------------------------------------------------------
 # Self-test + line-by-line performance analysis
@@ -154,16 +433,39 @@ if __name__ == "__main__":
     mesh.translate((-5, -5, -2.5))
     sdf_original = Sdfer.from_mesh(mesh, pitch=PITCH, block_size=PITCH * 10)
 
-    traj_file = f"assets/gcode/test.ncc"
+    traj_file = "assets/gcode/test.ncc"
     with open(traj_file, "r", encoding="utf-8") as fp:
         traj = GCodeReader.load(fp)
         traj = as_xp_array(traj)
 
     sim = Simulator(cutter, mesh, pitch=PITCH, block_size=PITCH * 10)
-    sdfer_cut, chip_voxel_list = sim.run(traj, vis_interval=10)
 
-    # Results visualization
-    plot_multiple_sdfer(
-        [sdf_original, sdfer_cut], opacities=[0.1, 1], colors=["lightgrey", "lightgrey"]
+    # Run simulation with animation
+    sdfer_cut, chip_voxel_list = sim.run_with_animation(
+        traj,
+        output_path="simulation.gif",
+        frame_interval=1,  # Record every step
+        fps=5,
+        show_cutter=True,
+        show_trajectory=True,
+        workpiece_color="lightblue",
+        cutter_color="red",
     )
+
+    # Create comparison animation (rotating view of before/after)
+    sim.create_comparison_animation(
+        sdf_original,
+        sdfer_cut,
+        traj,
+        output_path="comparison.gif",
+        fps=10,
+        n_frames=72,  # 2 full rotations at 10fps = ~7 seconds
+    )
+
+    # Also show interactive visualization
+    plot_multiple_sdfer(
+        [sdf_original, sdfer_cut], opacities=[0.1, 1], colors=["lightgrey", "lightblue"]
+    )
+
+    # Show chip volume distribution
     sim.visualize_chip_volume_3d(traj[:, :3], chip_voxel_list, pitch=PITCH)
