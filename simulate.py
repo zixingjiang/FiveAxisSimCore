@@ -1,5 +1,4 @@
 import numpy as np
-import cupy as cp
 import open3d as o3d
 from cutter import BaseCutter, TapperCutter, CylinderCutter, BallCutter
 from utils.logger import Logger
@@ -32,15 +31,15 @@ class Simulator:
     # ------------------------------------------------------------
     # Trajectory-aware AABB global clipping, only keep voxels that may be cut
     # ------------------------------------------------------------
-    def _prefilter_workpiece(self, trajectory: xp.ndarray):
-        """Pre-filter workpiece voxels based on trajectory direction-aware bounding box (GPU compatible)"""
+    def _prefilter_workpiece(self, trajectory: np.ndarray):
+        """Pre-filter workpiece voxels based on trajectory direction-aware bounding box"""
         cutter = self.cutter
         pts = as_xp_array(self.sdfer_workpiece.pts)
 
-        # 1. Trajectory positions and directions (keep on CPU)
+        # 1. Trajectory positions and directions
         pos = as_xp_array(trajectory[:, :3])
         dirs = as_xp_array(trajectory[:, 3:6])
-        dirs /= xp.linalg.norm(dirs, axis=1, keepdims=True)
+        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
 
         # 2. Direction-aware bounding box
         Rmax = max(
@@ -50,11 +49,11 @@ class Simulator:
         )
         p_min = pos - dirs * cutter.length - Rmax
         p_max = pos + dirs * cutter.length + Rmax
-        traj_min = xp.min(p_min, axis=0)
-        traj_max = xp.max(p_max, axis=0)
+        traj_min = np.min(p_min, axis=0)
+        traj_max = np.max(p_max, axis=0)
         margin = 2 * self.pitch
 
-        # 3. Global mask filtering (entirely on GPU)
+        # 3. Global mask filtering
         mask_global = (
             (pts[:, 0] >= traj_min[0] - margin)
             & (pts[:, 0] <= traj_max[0] + margin)
@@ -65,13 +64,13 @@ class Simulator:
         )
 
         # Directly set active mask inside Sdfer
-        self.sdfer_workpiece.active_mask = mask_global # AABB Prefiltering
-        self.sdfer_workpiece.deactivate_outer_volume() # Deactivate outer voxels
+        self.sdfer_workpiece.active_mask = mask_global  # AABB Prefiltering
+        self.sdfer_workpiece.deactivate_outer_volume()  # Deactivate outer voxels
 
     # ------------------------------------------------------------
     # Main simulation loop
     # ------------------------------------------------------------
-    def run(self, trajectory: xp.ndarray, vis_interval: int = 500):
+    def run(self, trajectory: np.ndarray, vis_interval: int = 500):
         """
         Execute cutting step-by-step according to the trajectory.
         Parameters
@@ -83,7 +82,9 @@ class Simulator:
         """
         # ---- Step 0: Global prefilter ----
         self._prefilter_workpiece(trajectory)
-        wp_cut = self.sdfer_workpiece # alias, changes will be in-place to self.sdfer_workpiece
+        wp_cut = (
+            self.sdfer_workpiece
+        )  # alias, changes will be in-place to self.sdfer_workpiece
         cutter = self.cutter
 
         # ---- Step 1: Main cutting loop ----
@@ -91,8 +92,8 @@ class Simulator:
         with tqdm(total=len(trajectory), ncols=100, desc="Simulating") as pbar:
             for i, row in enumerate(trajectory):
                 x, y, z, i_, j_, k_ = row
-                origin = xp.array([x, y, z])
-                direction = xp.array([i_, j_, k_])
+                origin = np.array([x, y, z])
+                direction = np.array([i_, j_, k_])
 
                 num_chip_voxels = cutter.cut_inplace(
                     wp_cut, origin, direction, margin=self.pitch * 4
@@ -102,7 +103,10 @@ class Simulator:
                 if (i + 1) % vis_interval == 0:
                     try:
                         cutter_sdf = cutter.get_sdfer(
-                            as_xp_array(wp_cut.pts), origin, direction, shape=wp_cut.shape
+                            as_xp_array(wp_cut.pts),
+                            origin,
+                            direction,
+                            shape=wp_cut.shape,
                         )
                         plot_multiple_sdfer([wp_cut, cutter_sdf], opacities=[0.9])
                     except Exception as e:
@@ -111,17 +115,20 @@ class Simulator:
                 pbar.update(1)
 
         return wp_cut, chip_voxel_list
-    
-    def visualize_chip_volume_3d(self, trajectory: np.ndarray, chip_voxel_list: list[int], pitch: float = 0.1):
+
+    def visualize_chip_volume_3d(
+        self, trajectory: np.ndarray, chip_voxel_list: list[int], pitch: float = 0.1
+    ):
         """
         Visualize the chip volume at each trajectory point using PyVista.
         trajectory: (N, 3)
         chip_voxel_list: (N,) int
         """
         import pyvista as pv
-        trajectory = cp.asnumpy(trajectory) if GPU_ENABLED else trajectory
+
+        trajectory = np.asarray(trajectory)
         chip_voxel_list = np.asarray(chip_voxel_list)
-        chip_volume_list = chip_voxel_list * (pitch ** 3)
+        chip_volume_list = chip_voxel_list * (pitch**3)
 
         # Construct point cloud
         cloud = pv.PolyData(trajectory)
@@ -156,5 +163,7 @@ if __name__ == "__main__":
     sdfer_cut, chip_voxel_list = sim.run(traj, vis_interval=10)
 
     # Results visualization
-    plot_multiple_sdfer([sdf_original, sdfer_cut], opacities=[0.1, 1], colors = ['lightgrey', 'lightgrey'])
+    plot_multiple_sdfer(
+        [sdf_original, sdfer_cut], opacities=[0.1, 1], colors=["lightgrey", "lightgrey"]
+    )
     sim.visualize_chip_volume_3d(traj[:, :3], chip_voxel_list, pitch=PITCH)
